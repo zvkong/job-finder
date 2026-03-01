@@ -1,3 +1,5 @@
 .streamlit/
 job_agent.py
 example.py
+__pycache__/
+*.pyc
