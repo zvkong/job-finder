@@ -6,11 +6,12 @@ import time
 import urllib.parse
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import google.generativeai as genai
 import requests
 import streamlit as st
+from atproto import Client
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 from googlesearch import search
@@ -20,7 +21,7 @@ from googlesearch import search
 # App Config
 # ============================================================
 
-APP_TITLE = "🎯 Postdoc Hunter (Direct Scraper Edition)"
+APP_TITLE = "🎯 Postdoc Hunter (Gemini Version)"
 PAGE_TITLE = "Postdoc Hunter Pro"
 
 REQUEST_TIMEOUT = 15
@@ -36,6 +37,23 @@ HEADERS = {
         "Chrome/122.0.0.0 Safari/537.36"
     )
 }
+
+DEFAULT_PRIORITY_PORTALS = [
+    {"name": "UW Statistics", "url": "https://stat.uw.edu/news-resources/jobs"},
+    {
+        "name": "NYU Careers",
+        "url": "https://www.nyu.edu/about/careers-at-nyu/faculty-and-researchers.html?keyword=postdoc",
+    },
+    {"name": "UT Austin", "url": "https://faculty.utexas.edu/career?q=postdoc&units=all"},
+    {"name": "Harvard", "url": "https://academicpositions.harvard.edu/postings/search"},
+]
+
+DEFAULT_SEARCH_SITES = [
+    "apply.interfolio.com",
+    "linkedin.com/jobs",
+    "mathjobs.org",
+    "academicjobsonline.org",
+]
 
 
 # ============================================================
@@ -90,11 +108,6 @@ def truncate_jobs_for_prompt(jobs: List[JobEntry], max_jobs: int) -> List[JobEnt
 
 
 def deduplicate_jobs(jobs: Iterable[JobEntry]) -> List[JobEntry]:
-    """
-    去重策略保持与之前一致的精神：
-    - 优先按 href 去重
-    - href 为空时，按 (title, source) 去重
-    """
     seen_links = set()
     seen_fallback = set()
     deduped: List[JobEntry] = []
@@ -133,8 +146,32 @@ def jobs_to_jsonable(jobs: List[JobEntry]) -> List[dict]:
     return [asdict(job) for job in jobs]
 
 
+def estimate_prompt_size(text: str) -> dict:
+    char_count = len(text)
+    line_count = text.count("\n") + 1 if text else 0
+    word_count = len(text.split()) if text else 0
+    approx_tokens = max(1, int(char_count / 4)) if text else 0
+
+    return {
+        "characters": char_count,
+        "lines": line_count,
+        "words": word_count,
+        "approx_tokens": approx_tokens,
+    }
+
+
+def make_bluesky_post_url(handle: str, uri: str) -> str:
+    if not handle or not uri:
+        return ""
+    parts = uri.split("/")
+    if len(parts) >= 5:
+        rkey = parts[-1]
+        return f"https://bsky.app/profile/{handle}/post/{rkey}"
+    return ""
+
+
 # ============================================================
-# Gemini Configuration
+# Gemini / Bluesky Configuration
 # ============================================================
 
 def load_gemini_api_key() -> str:
@@ -144,13 +181,37 @@ def load_gemini_api_key() -> str:
         return ""
 
 
+def load_bluesky_credentials() -> tuple[str, str]:
+    try:
+        handle = st.secrets["BLUESKY_HANDLE"]
+        app_password = st.secrets["BLUESKY_APP_PASSWORD"]
+        return handle, app_password
+    except Exception:
+        return "", ""
+
+
 def configure_gemini(api_key: str):
     genai.configure(api_key=api_key, transport="rest")
     return genai.GenerativeModel(GEMINI_MODEL_NAME)
 
 
+def configure_bluesky_client() -> Client | None:
+    handle, app_password = load_bluesky_credentials()
+    if not handle or not app_password:
+        return None
+
+    try:
+        client = Client()
+        client.login(handle, app_password)
+        return client
+    except Exception as e:
+        st.error("Failed to authenticate with Bluesky.")
+        st.error(str(e))
+        return None
+
+
 # ============================================================
-# Scrapers
+# Scrapers: Portals / Direct Boards
 # ============================================================
 
 def fetch_umich_jobs(days_to_search: int) -> List[JobEntry]:
@@ -185,7 +246,6 @@ def fetch_umich_jobs(days_to_search: int) -> List[JobEntry]:
                 if (today - job_date).days > days_to_search:
                     continue
             except Exception:
-                # 保持原逻辑：日期解析失败时不强行过滤
                 pass
 
             title = clean_text(title_tag.get_text()) if title_tag else "Unknown"
@@ -209,17 +269,13 @@ def fetch_umich_jobs(days_to_search: int) -> List[JobEntry]:
     return jobs
 
 
-def fetch_other_priority_universities() -> List[JobEntry]:
+def fetch_other_priority_universities(priority_portals: List[Tuple[str, str]]) -> List[JobEntry]:
     jobs: List[JobEntry] = []
 
-    target_urls = [
-        ("UW Statistics", "https://stat.uw.edu/news-resources/jobs"),
-        ("NYU Careers", "https://www.nyu.edu/about/careers-at-nyu/faculty-and-researchers.html?keyword=postdoc"),
-        ("UT Austin", "https://faculty.utexas.edu/career?q=postdoc&units=all"),
-        ("Harvard", "https://academicpositions.harvard.edu/postings/search"),
-    ]
+    for uni_name, url in priority_portals:
+        if not uni_name or not url:
+            continue
 
-    for uni_name, url in target_urls:
         response = safe_get(url)
         if not response:
             continue
@@ -319,7 +375,6 @@ def fetch_nature_jobs() -> List[JobEntry]:
 
 def fetch_interfolio_via_ddg() -> List[JobEntry]:
     jobs: List[JobEntry] = []
-
     try:
         with DDGS() as ddgs:
             for result in ddgs.text("site:apply.interfolio.com postdoc statistics", max_results=10):
@@ -333,7 +388,6 @@ def fetch_interfolio_via_ddg() -> List[JobEntry]:
                 )
     except Exception:
         pass
-
     return jobs
 
 
@@ -345,18 +399,305 @@ def fetch_direct_job_boards() -> List[JobEntry]:
     return jobs
 
 
-def fetch_google_jobs() -> List[JobEntry]:
+# ============================================================
+# Sidebar Controls
+# ============================================================
+
+def render_agent_settings():
+    with st.sidebar.expander("Agent Settings", expanded=True):
+        search_days = st.radio(
+            "Search Timeframe (Days)",
+            options=[1, 3, 5],
+            index=1,
+            horizontal=True,
+            key="search_days_radio",
+        )
+
+        editable_strategy = st.text_area(
+            "EXTRACTION STRATEGY",
+            value="""1. Extract ALL legitimate Postdoc/Research Fellow jobs in Statistics/Biostatistics from the raw data.
+2. Highlight and prioritize jobs mentioning Small Area Estimation (SAE), Spatial models, or Bayesian methodology.
+3. Prioritize targeted universities: UMich, UW, NYU, UT Austin, and Harvard.
+4. If there are fewer than 10 perfect matches, generously RELAX the research focus criteria to include other high-quality Statistics/Data Science postdoc roles. Include as many valid jobs as possible.""",
+            height=300,
+            key="editable_strategy_textarea",
+        )
+    return search_days, editable_strategy
+
+
+def render_priority_portal_controls() -> List[Tuple[str, str]]:
+    with st.sidebar.expander("Priority Portal Controls", expanded=False):
+        if st.button("Add Priority Portal", key="add_priority_portal_btn"):
+            st.session_state.priority_portals.append({"name": "", "url": ""})
+
+        portals = []
+        remove_index = None
+
+        for i, portal in enumerate(st.session_state.priority_portals):
+            st.markdown(f"**Priority Portal {i + 1}**")
+
+            name = st.text_input(
+                f"Priority Name {i + 1}",
+                value=portal["name"],
+                key=f"priority_name_{i}",
+            )
+            url = st.text_input(
+                f"Priority URL {i + 1}",
+                value=portal["url"],
+                key=f"priority_url_{i}",
+            )
+
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("Remove", key=f"remove_priority_{i}"):
+                    remove_index = i
+            with col2:
+                st.write("")
+
+            st.session_state.priority_portals[i]["name"] = name.strip()
+            st.session_state.priority_portals[i]["url"] = url.strip()
+
+            if name.strip() and url.strip():
+                portals.append((name.strip(), url.strip()))
+
+        if remove_index is not None:
+            st.session_state.priority_portals.pop(remove_index)
+            st.rerun()
+
+    return portals
+
+
+def render_search_engine_controls():
+    with st.sidebar.expander("Search Engine Query Controls", expanded=False):
+        base_keyword = st.text_input(
+            "Base keyword",
+            value="postdoc statistics",
+            key="search_base_keyword",
+        )
+
+        region_keyword = st.text_input(
+            "Region keyword",
+            value="USA",
+            key="search_region_keyword",
+        )
+
+        extra_keyword = st.text_input(
+            "Extra keyword",
+            value="",
+            help="例如 Bayesian OR spatial OR biostatistics",
+            key="search_extra_keyword",
+        )
+
+        st.markdown("**Search Sites**")
+        if st.button("Add Search Site", key="add_search_site_btn"):
+            st.session_state.search_sites.append("")
+
+        cleaned_sites = []
+        remove_index = None
+
+        for i, site in enumerate(st.session_state.search_sites):
+            col1, col2 = st.columns([5, 1])
+
+            with col1:
+                new_site = st.text_input(
+                    f"Site {i + 1}",
+                    value=site,
+                    key=f"search_site_{i}",
+                )
+
+            with col2:
+                st.write("")
+                st.write("")
+                if st.button("X", key=f"remove_site_{i}"):
+                    remove_index = i
+
+            st.session_state.search_sites[i] = new_site.strip()
+            if new_site.strip():
+                cleaned_sites.append(new_site.strip())
+
+        if remove_index is not None:
+            st.session_state.search_sites.pop(remove_index)
+            st.rerun()
+
+        num_results = st.number_input(
+            "Results per query",
+            min_value=1,
+            max_value=25,
+            value=5,
+            step=1,
+            key="search_num_results",
+        )
+
+    return {
+        "base_keyword": base_keyword.strip(),
+        "region_keyword": region_keyword.strip(),
+        "extra_keyword": extra_keyword.strip(),
+        "sites": cleaned_sites,
+        "num_results": int(num_results),
+    }
+
+
+def render_bluesky_controls():
+    with st.sidebar.expander("Bluesky Keywords", expanded=False):
+        bluesky_base = st.text_input(
+            "Bluesky base keyword",
+            value="postdoc",
+            key="bluesky_base_keyword",
+        )
+        bluesky_region = st.text_input(
+            "Bluesky region keyword",
+            value="",
+            key="bluesky_region_keyword",
+        )
+        bluesky_extra = st.text_input(
+            "Bluesky extra keyword",
+            value="lang:en",
+            key="bluesky_extra_keyword",
+        )
+        bluesky_num_results = st.number_input(
+            "Bluesky results",
+            min_value=1,
+            max_value=25,
+            value=5,
+            step=1,
+            key="bluesky_num_results",
+        )
+
+    return {
+        "base_keyword": bluesky_base.strip(),
+        "region_keyword": bluesky_region.strip(),
+        "extra_keyword": bluesky_extra.strip(),
+        "num_results": int(bluesky_num_results),
+    }
+
+
+def render_buttons():
+    btn_realtime = st.button(
+        "⚡ Start Real-Time Web Scan (Direct Scraper + DDG Interfolio)",
+        type="primary",
+        use_container_width=True,
+        disabled=st.session_state.running,
+    )
+
+    with st.expander("🛠️ Search Engine Tools", expanded=True):
+        st.warning("Google may fail due to anti-bot / IP rate limits. DDG and Bluesky are usually more stable.")
+        btn_google = st.button(
+            "☕ Run Google Precision Scan",
+            use_container_width=True,
+            disabled=st.session_state.running,
+        )
+        btn_ddg = st.button(
+            "🦆 Run DDG Precision Scan",
+            use_container_width=True,
+            disabled=st.session_state.running,
+        )
+        btn_bluesky = st.button(
+            "🦋 Run Bluesky Precision Scan",
+            use_container_width=True,
+            disabled=st.session_state.running,
+        )
+
+    if btn_realtime:
+        st.session_state.should_run_scan = True
+        st.session_state.selected_engine = "realtime"
+
+    if btn_google:
+        st.session_state.should_run_scan = True
+        st.session_state.selected_engine = "google"
+
+    if btn_ddg:
+        st.session_state.should_run_scan = True
+        st.session_state.selected_engine = "ddg"
+
+    if btn_bluesky:
+        st.session_state.should_run_scan = True
+        st.session_state.selected_engine = "bluesky"
+
+
+# ============================================================
+# Query Builders
+# ============================================================
+
+def build_search_queries(config: dict) -> List[str]:
+    base = config["base_keyword"]
+    region = config["region_keyword"]
+    extra = config["extra_keyword"]
+    sites = [s for s in config["sites"] if s]
+
+    tail = " ".join([x for x in [base, region, extra] if x]).strip()
+
+    queries = []
+    for site in sites:
+        query = f"site:{site} {tail}".strip()
+        if query:
+            queries.append(query)
+    return queries
+
+
+def build_bluesky_queries(config: dict) -> List[str]:
+    base = config["base_keyword"].strip()
+    region = config["region_keyword"].strip()
+    extra = config["extra_keyword"].strip()
+
+    queries: List[str] = []
+
+    if base:
+        queries.append(base)
+
+    if base and region:
+        queries.append(f"{base} {region}".strip())
+
+    if base and extra:
+        queries.append(f"{base} {extra}".strip())
+
+    if base and region and extra:
+        queries.append(f"{base} {region} {extra}".strip())
+
+    if base and "postdoc" not in base.lower():
+        queries.append(f"{base} postdoc".strip())
+
+    if region:
+        queries.append(f"postdoc {region}".strip())
+
+    if extra:
+        queries.append(f"postdoc {extra}".strip())
+
+    # Hard-coded broad fallback queries
+    queries.append("postdoc")
+    queries.append("hiring postdoc")
+    queries.append("statistics postdoc")
+    queries.append("biostatistics postdoc")
+    queries.append("data science postdoc")
+    queries.append("research fellow")
+    queries.append("academic hiring")
+
+    seen = set()
+    result = []
+    for q in queries:
+        q2 = " ".join(q.split())
+        if q2 and q2 not in seen:
+            seen.add(q2)
+            result.append(q2)
+
+    return result
+
+
+# ============================================================
+# Search Engines
+# ============================================================
+
+def fetch_google_jobs(queries: List[str], num_results: int = 5) -> List[JobEntry]:
     jobs: List[JobEntry] = []
-    queries = [
-        "site:apply.interfolio.com postdoc statistics USA",
-        "site:linkedin.com/jobs postdoc statistics USA",
-        "site:mathjobs.org postdoc statistics",
-        "site:academicjobsonline.org postdoc statistics",
-    ]
 
     for query in queries:
+        st.write(f"Running Google query: {query}")
         try:
-            for result in search(query, num_results=5, sleep_interval=4.0, advanced=True):
+            raw_results = list(
+                search(query, num_results=num_results, sleep_interval=4.0, advanced=True)
+            )
+            st.write(f"Raw results returned: {len(raw_results)}")
+
+            for result in raw_results:
                 jobs.append(
                     JobEntry(
                         title=clean_text(getattr(result, "title", "")),
@@ -366,10 +707,116 @@ def fetch_google_jobs() -> List[JobEntry]:
                     )
                 )
             time.sleep(random.uniform(3, 5))
-        except Exception:
-            pass
+
+        except Exception as e:
+            err = str(e)
+            if "google.com/sorry" in err or "429" in err:
+                st.warning(f"Google anti-bot triggered for query: {query}")
+                st.error(err)
+            else:
+                st.error(f"Google query failed: {query}")
+                st.error(err)
 
     return jobs
+
+
+def fetch_ddg_jobs(queries: List[str], num_results: int = 5) -> List[JobEntry]:
+    jobs: List[JobEntry] = []
+
+    try:
+        with DDGS() as ddgs:
+            for query in queries:
+                st.write(f"Running DDG query: {query}")
+                try:
+                    raw_results = list(ddgs.text(query, max_results=num_results))
+                    st.write(f"Raw results returned: {len(raw_results)}")
+
+                    for result in raw_results:
+                        jobs.append(
+                            JobEntry(
+                                title=clean_text(result.get("title", "")),
+                                href=clean_text(result.get("href", "")),
+                                body=clean_text(result.get("body", "")),
+                                source="DDG Precision Search",
+                            )
+                        )
+                    time.sleep(random.uniform(1, 2))
+
+                except Exception as e:
+                    st.error(f"DDG query failed: {query}")
+                    st.error(str(e))
+    except Exception as e:
+        st.error("Failed to initialize DuckDuckGo search client.")
+        st.error(str(e))
+
+    return jobs
+
+
+def fetch_bluesky_jobs(queries: List[str], num_results: int = 5) -> List[JobEntry]:
+    jobs: List[JobEntry] = []
+
+    client = configure_bluesky_client()
+    if client is None:
+        st.error("Bluesky client is not available. Check BLUESKY_HANDLE and BLUESKY_APP_PASSWORD.")
+        return jobs
+
+    for query in queries:
+        st.write(f"Running Bluesky query: {query}")
+
+        try:
+            response = client.app.bsky.feed.search_posts(
+                params={
+                    "q": query,
+                    "limit": num_results,
+                }
+            )
+
+            posts = getattr(response, "posts", []) or []
+            st.write(f"Raw results returned: {len(posts)}")
+
+            for post in posts:
+                author = getattr(post, "author", None)
+                record = getattr(post, "record", None)
+
+                handle = clean_text(getattr(author, "handle", "") if author else "")
+                uri = clean_text(getattr(post, "uri", ""))
+
+                indexed_at = ""
+                if hasattr(post, "indexed_at"):
+                    indexed_at = clean_text(getattr(post, "indexed_at", ""))
+                elif hasattr(post, "indexedAt"):
+                    indexed_at = clean_text(getattr(post, "indexedAt", ""))
+
+                text = ""
+                if record is not None and hasattr(record, "text"):
+                    text = clean_text(getattr(record, "text", ""))
+
+                href = make_bluesky_post_url(handle, uri)
+
+                body_parts = []
+                if handle:
+                    body_parts.append(f"Author: {handle}")
+                if indexed_at:
+                    body_parts.append(f"IndexedAt: {indexed_at}")
+                if text:
+                    body_parts.append(f"Post: {text[:300]}")
+
+                jobs.append(
+                    JobEntry(
+                        title=text[:180] if text else "Bluesky Post",
+                        href=href,
+                        body=" | ".join(body_parts),
+                        source="Bluesky Search",
+                    )
+                )
+
+            time.sleep(random.uniform(1, 2))
+
+        except Exception as e:
+            st.error(f"Bluesky query failed: {query}")
+            st.error(str(e))
+
+    return deduplicate_jobs(jobs)
 
 
 # ============================================================
@@ -430,6 +877,7 @@ def call_gemini_with_retry(model, content: str, max_retries: int = 5) -> str:
 
     return f"### 🚨 Gemini quota or rate limit exceeded after retries.\n\nRaw error:\n{last_error}"
 
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_gemini_report(
     jobs_text: str,
@@ -460,75 +908,24 @@ def initialize_session_state():
         st.session_state.gemini_call_count = 0
     if "last_prompt_chars" not in st.session_state:
         st.session_state.last_prompt_chars = 0
-
-def estimate_prompt_size(text: str) -> dict:
-    char_count = len(text)
-    line_count = text.count("\n") + 1 if text else 0
-    word_count = len(text.split()) if text else 0
-
-    # 非精确估计，只用于诊断
-    approx_tokens = max(1, int(char_count / 4)) if text else 0
-
-    return {
-        "characters": char_count,
-        "lines": line_count,
-        "words": word_count,
-        "approx_tokens": approx_tokens,
-    }
-def render_sidebar():
-    st.sidebar.header("Agent Settings")
-    search_days = st.sidebar.radio(
-        "Search Timeframe (Days)",
-        options=[1, 3, 5],
-        index=1,
-        horizontal=True,
-    )
-    st.sidebar.markdown("---")
-
-    editable_strategy = st.sidebar.text_area(
-        "EXTRACTION STRATEGY",
-        value="""1. Extract ALL legitimate Postdoc/Research Fellow jobs in Statistics/Biostatistics from the raw data.
-2. Highlight and prioritize jobs mentioning Small Area Estimation (SAE), Spatial models, or Bayesian methodology.
-3. Prioritize targeted universities: UMich, UW, NYU, UT Austin, and Harvard.
-4. If there are fewer than 10 perfect matches, generously RELAX the research focus criteria to include other high-quality Statistics/Data Science postdoc roles. Include as many valid jobs as possible.""",
-        height=300,
-    )
-    return search_days, editable_strategy
-
-
-def render_buttons():
-    btn_realtime = st.button(
-        "⚡ Start Real-Time Web Scan (Direct Scraper + DDG)",
-        type="primary",
-        use_container_width=True,
-        disabled=st.session_state.running,
-    )
-
-    with st.expander("🛠️ Advanced / Daily Push Tools (Google Engine)"):
-        st.warning("Warning: Use Google Engine sparingly to avoid IP block.")
-        btn_google = st.button(
-            "☕ Run Google Precision Scan (Slow)",
-            use_container_width=True,
-            disabled=st.session_state.running,
-        )
-
-    return btn_realtime, btn_google
+    if "priority_portals" not in st.session_state:
+        st.session_state.priority_portals = [item.copy() for item in DEFAULT_PRIORITY_PORTALS]
+    if "search_sites" not in st.session_state:
+        st.session_state.search_sites = DEFAULT_SEARCH_SITES.copy()
+    if "should_run_scan" not in st.session_state:
+        st.session_state.should_run_scan = False
+    if "selected_engine" not in st.session_state:
+        st.session_state.selected_engine = None
 
 
 # ============================================================
-# Workflow
+# Workflow Helpers
 # ============================================================
 
-def run_portal_scan(actual_days: int):
+def run_portal_scan(actual_days: int, priority_portals: List[Tuple[str, str]]):
     p1 = fetch_umich_jobs(actual_days)
-    p2 = fetch_other_priority_universities()
+    p2 = fetch_other_priority_universities(priority_portals)
     return p1, p2
-
-
-def run_engine_scan(use_google: bool):
-    if use_google:
-        return fetch_google_jobs()
-    return fetch_direct_job_boards()
 
 
 def build_final_job_pool(
@@ -539,6 +936,10 @@ def build_final_job_pool(
     raw_all = portal_jobs_a + portal_jobs_b + engine_jobs
     return deduplicate_jobs(raw_all)
 
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
     st.set_page_config(page_title=PAGE_TITLE, layout="wide")
@@ -551,10 +952,29 @@ def main():
         st.error("Gemini API key not found. Please set GEMINI_API_KEY in .streamlit/secrets.toml")
         st.stop()
 
-    search_days, editable_strategy = render_sidebar()
-    btn_realtime, btn_google = render_buttons()
+    search_days, editable_strategy = render_agent_settings()
+    priority_portals = render_priority_portal_controls()
+    search_engine_config = render_search_engine_controls()
+    bluesky_config = render_bluesky_controls()
 
-    if not (btn_realtime or btn_google):
+    search_queries = build_search_queries(search_engine_config)
+    bluesky_queries = build_bluesky_queries(bluesky_config)
+
+    render_buttons()
+
+    if st.button("Test Bluesky Only", disabled=st.session_state.running, key="btn_test_bluesky"):
+        client = configure_bluesky_client()
+        if client is not None:
+            try:
+                response = client.app.bsky.feed.search_posts(
+                    params={"q": "postdoc", "limit": 3}
+                )
+                posts = getattr(response, "posts", []) or []
+                st.success(f"Bluesky auth OK. Retrieved {len(posts)} posts.")
+            except Exception as e:
+                st.error(f"Bluesky test failed: {e}")
+
+    if not st.session_state.should_run_scan:
         return
 
     if st.session_state.running:
@@ -568,23 +988,43 @@ def main():
         actual_days = search_days
 
         with st.spinner("Searching Priority Portals..."):
-            p1, p2 = run_portal_scan(actual_days)
+            p1, p2 = run_portal_scan(actual_days, priority_portals)
             st.write(f"✔️ Portals: {len(p1) + len(p2)} items.")
 
-        if btn_google:
+        if st.session_state.selected_engine == "google":
             with st.spinner("Executing Google Search..."):
-                engine_jobs = run_engine_scan(use_google=True)
+                engine_jobs = fetch_google_jobs(
+                    queries=search_queries,
+                    num_results=search_engine_config["num_results"],
+                )
                 st.write(f"✔️ Google: {len(engine_jobs)} items.")
+
+        elif st.session_state.selected_engine == "ddg":
+            with st.spinner("Executing DuckDuckGo Search..."):
+                engine_jobs = fetch_ddg_jobs(
+                    queries=search_queries,
+                    num_results=search_engine_config["num_results"],
+                )
+                st.write(f"✔️ DDG: {len(engine_jobs)} items.")
+
+        elif st.session_state.selected_engine == "bluesky":
+            with st.spinner("Executing Bluesky Search..."):
+                engine_jobs = fetch_bluesky_jobs(
+                    queries=bluesky_queries,
+                    num_results=bluesky_config["num_results"],
+                )
+                st.write(f"✔️ Bluesky: {len(engine_jobs)} items.")
+
         else:
             with st.spinner("Direct Scraping MathJobs, Nature & Interfolio..."):
-                engine_jobs = run_engine_scan(use_google=False)
+                engine_jobs = fetch_direct_job_boards()
                 st.write(f"✔️ Direct Scrapers: {len(engine_jobs)} items.")
 
         all_jobs = build_final_job_pool(p1, p2, engine_jobs)
         st.write(f"**Total unique jobs found:** {len(all_jobs)}")
 
         if not all_jobs:
-            st.error("No results found. Please check connection or site structure.")
+            st.error("No results found. Please check connection, site structure, or search engine availability.")
             return
 
         prompt_jobs = truncate_jobs_for_prompt(all_jobs, MAX_JOBS_SENT_TO_GEMINI)
@@ -611,9 +1051,11 @@ def main():
                 final_system_prompt=final_system_prompt,
                 _cache_buster=GEMINI_MODEL_NAME,
             )
+
         with st.expander("📈 Gemini Call Status", expanded=False):
             st.write(f"Total Gemini calls in this session: {st.session_state.gemini_call_count}")
             st.write(f"Last prompt characters: {st.session_state.last_prompt_chars}")
+
         st.success("Report Generated!")
         st.markdown("---")
         st.markdown(report)
@@ -624,8 +1066,19 @@ def main():
         with st.expander("🔍 Debug Prompt Sent to Gemini"):
             st.text(jobs_text)
 
+        with st.expander("🔍 Debug Search Queries"):
+            st.json(search_queries)
+
+        with st.expander("🔍 Debug Bluesky Query"):
+            st.json(bluesky_queries)
+
+        with st.expander("🔍 Debug Priority Portals"):
+            st.json([{"name": name, "url": url} for name, url in priority_portals])
+
     finally:
         st.session_state.running = False
+        st.session_state.should_run_scan = False
+        st.session_state.selected_engine = None
 
 
 if __name__ == "__main__":
