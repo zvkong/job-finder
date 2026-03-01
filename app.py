@@ -21,7 +21,7 @@ from googlesearch import search
 # App Config
 # ============================================================
 
-APP_TITLE = "🎯 Postdoc Hunter (Gemini Version)"
+APP_TITLE = "🎯 Postdoc Hunter (Statistics)"
 PAGE_TITLE = "Postdoc Hunter Pro"
 
 REQUEST_TIMEOUT = 15
